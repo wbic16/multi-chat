@@ -120,9 +120,17 @@ def load(cfg):
 
 
 def save(cfg, scrolls):
+    # Phext delimiters encode *relative* coordinate movement, so implode must
+    # receive scrolls in ascending coordinate order. The loaded dict's order is
+    # archive order followed by newly appended messages; once the index scroll
+    # (library 3) exists, a new library-1 message would be emitted *after* it,
+    # the walk cannot rewind, and explode glues that message into the index
+    # scroll. Found live 2026-11-04 on the second-ever compact of /chat/emise
+    # (the verify-before-delete check caught it; no data lost). Grok's original
+    # has the same latent bug. Fix: always sort by coordinate before implode.
     tmp = cfg.archive + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        f.write(PX.implode({Coordinate(*k): v for k, v in scrolls.items()}))
+        f.write(PX.implode({Coordinate(*k): v for k, v in sorted(scrolls.items())}))
     os.replace(tmp, cfg.archive)
     os.chmod(cfg.archive, 0o644)
 
@@ -136,6 +144,7 @@ def compact(cfg, dry):
     scrolls = load(cfg)
     idx = index_lines(cfg, scrolls)
     moved = []
+    expected = {}
     for side_dir, lib in cfg.sides.items():
         if not os.path.isdir(side_dir):
             continue
@@ -156,6 +165,7 @@ def compact(cfg, dry):
             if any(c in body for c in LEVELS):
                 body = "".join(c for c in body if c not in LEVELS)  # control bytes would corrupt the structure
             scrolls[coord] = body.rstrip("\n")
+            expected[coord] = scrolls[coord]
             idx.append("%s %s/%s (year %s)" % (fmt(coord), side, name, m.group(1)))
             moved.append(path)
     if dry:
@@ -163,11 +173,14 @@ def compact(cfg, dry):
         return
     scrolls[cfg.index_coord] = "\n".join(idx)
     save(cfg, scrolls)
-    # verify the archive reads back before removing anything
+    # verify the archive reads back *exactly* before removing anything:
+    # each new scroll present with byte-identical content, index intact
     check = load(cfg)
-    for line in idx[-len(moved):] if moved else []:
-        if unfmt(line.split(" ")[0]) not in check:
+    for coord, body in expected.items():
+        if check.get(coord) != body:
             raise SystemExit("verification failed, loose files kept")
+    if index_lines(cfg, check) != idx:
+        raise SystemExit("verification failed (index), loose files kept")
     for p in moved:
         os.remove(p)
     print("archived %d file(s) into %s" % (len(moved), cfg.archive))
